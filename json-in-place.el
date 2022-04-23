@@ -9,7 +9,7 @@
 ;; Version: 0.0.1
 ;; Keywords: data files lisp
 ;; Homepage: https://github.com/RobinMarchart/json-in-place
-;; Package-Requires: ((emacs "27.1"))
+;; Package-Requires: ((emacs "28.1"))
 ;;
 ;; This file is not part of GNU Emacs.
 ;;
@@ -23,7 +23,7 @@
 (require 'json)
 
 (eval-and-compile
-  (if (and (> emacs-major-version 28) (> emacs-minor-version 1) (fboundp 'json-available-p) (funcall (symbol-function 'json-available-p)))
+  (if (json-available-p)
       ;; use native parsing
       (progn
         (defalias 'json-in-place--json-insert #'json-insert
@@ -47,11 +47,8 @@ Special mappings:
 ':null->null
 ':false->false
 nil->{}"
-             (let (_)
-               (defvar json-false)
-               (defvar json-null)
-               (let ((json-false ':false) (json-null ':null))
-                 (insert (json-encode value)))))
+             (dlet ((json-false :false) (json-null :null))
+               (insert (json-encode value))))
       (defun json-in-place--json-parse () "Parses json value from point. Point is moved to after the value.
 json types are represented as follows:
 null: ':null
@@ -59,27 +56,26 @@ false: ':false
 true: t
 array: array
 object: alist"
-             (let (_)
-               (defvar json-false)
-               (defvar json-null)
-               (defvar json-object-type)
-               (defvar json-array-type)
-               (let ((json-false) ':false (json-null ':null) (json-object-type 'alist) (json-array-type 'vector))))))))
+             (dlet ((json-false :false) (json-null :null) (json-object-type 'alist) (json-array-type 'vector))
+               (json-read))))))
 
-(defclass json-in-place-observable ()
-  ((change :initform () :type list)
-   (removal :initform () :type list))
-  "Value that supports registering change handlers.
-CHANGE is a function taking two arguments (new and old) executed when a non
-array/object value is replaced or an array/object is replaced with another type.
-REMOVAL is executed with the old entry if it is to be removed."
-  :abstract t)
 (defclass json-in-place-parent () () "Potential parent of a value." :abstract t)
-(defclass json-in-place-value (json-in-place-observable)
+(defclass json-in-place-value ()
   ((len :initarg :len :type integer)
    (parent :initarg :parent :type json-in-place-parent)
+   (change :initform () :type list)
+   (removal :initform () :type list)
+   (verifier :type function :initform #'ignore)
    (active :initform t :type boolean))
-  "Serializable JSON value." :abstract t)
+  "Serializable JSON value.
+LEN is the length of the item in buffer.
+PARENT is the parent value
+CHANGE is a function taking two arguments (new and old) executed when a non
+array/object value is replaced or an array/object is replaced with another type.
+REMOVAL is executed with the old entry if it is to be removed
+VERIFIER is a function that takes the value and returns nil if the value is
+valid, else a string describing the problem
+ACTIVE is t, if this value is part of a json hierarchy." :abstract t)
 (defclass json-in-place-container (json-in-place-value)
   ((child-change :initform () :type list)
    (container-change :initform () :type list)) "Container for other values.
@@ -172,13 +168,9 @@ Recursively update parents.")
 All hooks are appended to NEW from OLD if appropriate."
   (unless (cl-typep new 'json-in-place-value) (error "Expected value, got: %s" new))
   (unless (cl-typep old 'json-in-place-value) (error "Expected value, got: %s" old))
-  (oset new removal (nconc (oref new removal) (oref old removal)))
-  (oset new change (nconc (oref new change) (oref old change)))
   (oset old active nil)
   (if (and (cl-typep new 'json-in-place-container) (eq (eieio-object-class new) (eieio-object-class old)))
       (progn
-        (oset new child-change (nconc (oref new child-change) (oref old child-change)))
-        (oset new container-change (nconc (oref new child-change) (oref old child-change)))
         (cond
          ((json-in-place-array-p new)
           (let ((new-i (oref new value))
@@ -228,6 +220,78 @@ All hooks are appended to NEW from OLD if appropriate."
       (when (json-in-place-object-p old)
         (dolist (entry (oref old value)) (json-in-place--run-entry-remove-hooks (cdr entry)))))))
 
+(defun json-in-place--move-hooks (new old)
+  "Run hooks to be executed when OLD is replaced by NEW.
+All hooks are appended to NEW from OLD if appropriate."
+  (unless (cl-typep new 'json-in-place-value) (error "Expected value, got: %s" new))
+  (unless (cl-typep old 'json-in-place-value) (error "Expected value, got: %s" old))
+  (oset new removal (nconc (oref new removal) (oref old removal)))
+  (oset new change (nconc (oref new change) (oref old change)))
+  (oset new verifier (oref old verifier))
+  (if (and (cl-typep new 'json-in-place-container) (eq (eieio-object-class new) (eieio-object-class old)))
+      (progn
+        (oset new child-change (nconc (oref new child-change) (oref old child-change)))
+        (oset new container-change (nconc (oref new child-change) (oref old child-change)))
+        (cond
+         ((json-in-place-array-p new)
+          (let ((new-i (oref new value))
+                (old-i (oref old value)))
+            (while (and new-i old-i)
+              (json-in-place--run-change-delete-hooks (oref (car new-i) value) (oref (car old-i) value))
+              (setq new-i (cdr new-i))
+              (setq old-i (cdr old-i)))))
+
+         ((json-in-place-object-p new)
+          (let* ((new-l (cons nil (copy-sequence (oref new value))))
+                 (old-l (cons nil (copy-sequence (oref old value))))
+                 (new-i new-l))
+            (while (cdr new-i)
+              (let ((old-i old-l) (not-found t))
+                (while (and (cdr old-i) not-found)
+                  (if (eq (car (cdr new-i)) (car (cdr old-i)))
+                      (progn
+                        (setq not-found nil)
+                        (json-in-place--run-change-delete-hooks (oref (cdr (car (cdr new-i))) value) (oref (cdr (car (cdr (old-i)))) value))
+                        (setcdr new-i (cdr (cdr new-i)))
+                        (setcdr old-i (cdr (cdr old-i))))
+                    (setq old-i (cdr old-i))))
+                (when not-found
+                  (setq new-i (cdr new-i)))))))
+         (t (error "Unknown container type: %s" (eieio-object-class new)))))))
+
+(defun json-in-place--verify (root)
+  "Verify ROOT structure by calling the installed verifier hooks.
+Return an alist of path to offending item and the problem."
+  (unless (json-in-place-root-p root)
+    (error "Invalid root value %s" root))
+  (let ((errors ())
+        (to-verify (cons `(() . ,(oref root value)) ())))
+    (while to-verify
+      (let* ((path (car (car to-verify)))
+             (value (cdr (car to-verify)))
+             (verify-result (funcall (oref value verifier) value)))
+        (when verify-result
+          (unless (stringp verify-result) (error "verifier should return string value on error."))
+          (setq errors (nconc errors (cons `(,path . , verify-result) ()))))
+        (cond
+         ((json-in-place-array-p value)
+          (let* ((children (copy-sequence (oref value value)))
+                 (index 0)
+                 (current children))
+            (while current
+              (setcar current `(,(nconc path (cons index ())) . ,(oref (car current) value)))
+              (setq index (1+ index))
+              (setq current (cdr current)))
+            (setq to-verify (nconc to-verify children))))
+         ((json-in-place-object-p value)
+          (setq to-verify
+                (nconc to-verify
+                       (mapcar
+                        (lambda (v)
+                          `(,(nconc path (cons (car v) ())) . , (oref (cdr v) value)))
+                        (oref value value)))))))
+      (setq to-verify (cdr to-verify)))
+    errors))
 
 (defun json-in-place--from-point (parent)
   "Create a string object from point.
@@ -237,7 +301,7 @@ Parent is set to PARENT."
     (error "Invalid parent object %s"parent))
   (let* (
          (begin (point))
-         (value (json-parse-buffer :object-type 'alist :array-type 'array))
+         (value (json-in-place--json-parse))
          (end (point))
          (endb (point-max))
          (object-length (- (if (equal end (- endb 1)) endb end) begin)))
@@ -300,11 +364,16 @@ nil, a message will be written on successful completion."
   (with-current-buffer (oref buffer-or-root buffer)
     (save-excursion
       (goto-char 0)
-      (let ((old (oref buffer-or-root value)))
-        (oset buffer-or-root value (json-in-place--from-point buffer-or-root))
-        (json-in-place--run-change-delete-hooks (oref buffer-or-root value) old))))
+      (let ((old (oref buffer-or-root value))
+            (new (json-in-place--from-point buffer-or-root)))
+        (json-in-place--move-hooks new old)
+        (oset buffer-or-root value new)
+        (let ((verify-result (json-in-place--verify new)))
+          (when verify-result
+            (oset buffer-or-root value old)
+            (error "Verification of new buffer contents failed:\n%s" verify-result)))
+        (json-in-place--run-change-delete-hooks new old))))
   (when print-status (message "Parsing complete")))
-
 
 (defun json-in-place-replace-value (old new)
   "Replace OLD with NEW in both data structure and buffer.
@@ -315,29 +384,37 @@ keys of objects can only be replaced by strings."
          (len (oref old len))
          (parent (oref old parent))
 
-         (buffer (let ((parent parent))
-                   (while (not (json-in-place-root-p parent))
-                     (setq offset (+ offset (oref parent offset)))
-                     (setq parent (oref (oref parent parent) parent)))
-                   (oref parent buffer)))
+         (root (let ((parent parent))
+                 (while (not (json-in-place-root-p parent))
+                   (setq offset (+ offset (oref parent offset)))
+                   (setq parent (oref (oref parent parent) parent)))
+                 parent))
+         (buffer (oref root buffer))
          (end (+ offset len)))
     (atomic-change-group
       (with-current-buffer buffer
         (save-excursion
           (goto-char end)
           (delete-region offset end)
-          (json-insert new)
+          (json-in-place--json-insert new)
           (goto-char offset)
           (let* ((new (json-in-place--from-point parent))
                  (difference (- len (oref new len))))
             (oset parent value new)
+            (json-in-place--move-hooks new old)
+            (let ((verify-result (json-in-place--verify root)))
+              (when verify-result
+                (oset parent value old)
+                (error "Verification of replacement failed:\n%s" verify-result)))
             (json-in-place--update-parent-offsets parent difference)
             (json-in-place--run-child-change-hooks (oref (oref old parent) parent))
             (json-in-place--run-change-delete-hooks new old)
             new))))))
 
-(cl-defmethod json-in-place-remove-entry ((entry json-in-place-container-entry))
+(defun json-in-place-remove-entry (entry)
   "Remove ENTRY from parent container."
+  (unless (cl-typep entry 'json-in-place-container-entry)
+    (error "Invalid container entry: %s" entry))
   (let ((index (oref entry index)) (prev (oref (oref entry parent) value)))
     (if (eq index prev)
         ;; first value
@@ -347,17 +424,22 @@ keys of objects can only be replaced by strings."
           (setq prev (cdr prev)))
         (setcdr prev (cdr index))))
     (let* ((offset 1)
-           (buffer (let ((parent (oref (oref entry parent) parent)))
-                     (while (not (json-in-place-root-p entry))
-                       (setq offset (+ offset (oref parent offset)))
-                       (setq parent (oref (oref parent parent) parent)))
-                     (oref parent buffer)))
+           (root (let ((parent (oref (oref entry parent) parent)))
+                   (while (not (json-in-place-root-p entry))
+                     (setq offset (+ offset (oref parent offset)))
+                     (setq parent (oref (oref parent parent) parent)))
+                   parent))
+           (buffer (oref root buffer))
            (start (+ offset (oref entry offset)))
            (end (if
                     (cdr index)
                     (+ offset (oref (car (cdr index)) offset))
                   (+ offset (oref (oref entry parent) len) -1)))
            (difference (- start end)))
+      (let ((verify-result (json-in-place--verify root)))
+        (when verify-result
+          (setcdr prev index)
+          (error "Verification after remove failed:\n%s" verify-result)))
       (with-current-buffer buffer
         (delete-region start end))
       (let ((index (cdr index)))
@@ -371,36 +453,24 @@ keys of objects can only be replaced by strings."
       (json-in-place--update-parent-offsets (oref (oref entry parent) parent) difference)
       (json-in-place--run-child-change-hooks (oref (oref entry parent) parent))
       (json-in-place--run-entry-remove-hooks entry)
-      (dolist (f (oref (oref entry parent) change)) (funcall f))
-      (iter-do (f (json-in-place--iter-parent-change-hooks (oref (oref (oref entry parent) parent) parent))) (funcall f))
-      (iter-do (f (json-in-place--iter-entry-remove entry)) (funcall f)))))
+      (dolist (f (oref (oref entry parent) container-change )) (funcall f 'remove (oref entry parent) entry)))))
 
-(cl-defgeneric json-in-place-insert ()
-  "Function used to insert values into an container.
-The exact arguments depend on the kind of container.")
-
-(cl-defmethod json-in-place-insert ((key string) value (container json-in-place-object))
+(defun json-in-place-insert (key value container)
   "Insert the KEY VALUE pair at the end of CONTAINER.
-KEY must be a string and VALUE must be serializable to JSON. A textual JSON
-representation of the KEY VALUE pair will be inserted at the right position.
-CONTAINER object. OBJECT must be a json-in-place-object value."
-  (json-in-place-insert (intern key) value container))
-
-
-(cl-defmethod json-in-place-insert ((key symbol) value (container json-in-place-object))
-  "Insert the KEY VALUE pair at the end of CONTAINER.
-KEY must be a symbol and VALUE must be serializable to JSON. A textual JSON
-representation of the KEY VALUE pair will be inserted at the right position.
-CONTAINER object. OBJECT must be a json-in-place-object value."
+KEY must be a symbol or string and VALUE must be serializable to JSON. A textual
+JSON representation of the KEY VALUE pair will be inserted at the right
+position. CONTAINER object. OBJECT must be a json-in-place-object value."
+  (unless (or (symbolp key) (stringp key)) (error "Invalid symbol or string: %s" key))
+  (unless (json-in-place-object-p container) (error "Invalid json-in-place-object: %s" container))
+  (when (stringp key) (setq key (intern key)))
   (let* ((offset 1)
-         (modify-hooks (append (oref container change) ()))
          (begin (+ offset (oref container len) -1))
-         (buffer (let ((parent (oref container parent)))
-                   (while (not (json-in-place-root-p parent))
-                     (setq offset (+ offset (oref parent offset)))
-                     (setq modify-hooks (append (oref (oref parent parent) change) modify-hooks))
-                     (setq parent (oref (oref parent parent) parent)))
-                   (oref parent buffer))))
+         (root (let ((parent (oref container parent)))
+                 (while (not (json-in-place-root-p parent))
+                   (setq offset (+ offset (oref parent offset)))
+                   (setq parent (oref (oref parent parent) parent)))
+                 parent))
+         (buffer (oref root buffer)))
     (with-current-buffer buffer
       (save-excursion
         (atomic-change-group
@@ -408,19 +478,25 @@ CONTAINER object. OBJECT must be a json-in-place-object value."
           (dlet ((print-escape-newlines t)
                  (print-escape-nonascii t)
                  (print-escape-newlines t))
-            (unless (eq () (oref container value)) (insert ","))
+            (when (oref container value) (insert ","))
             (insert (prin1-to-string (symbol-name key)) " : "))
           (let ((off (point)))
-            (json-insert value)
+            (json-in-place--json-insert value)
             (let ((diff (- (point) begin)))
               (goto-char off)
               (let ((entry (json-in-place-object-entry :parent container :index (cons () ()) :offset off :value ())))
                 (oset entry value (json-in-place--from-point entry))
                 (setcar (oref entry index) (cons key entry))
                 (oset container value (nconc (oref container value) (oref entry index)))
+                (let ((verify-result (json-in-place--verify root)))
+                  (when verify-result
+                    ;; remove inserted value
+                    (oset container value (seq-take (oref container value) (- (seq-length (oref container value)) 1)))
+                    (error "Verification failed after insertion:\n%s" verify-result)))
                 (oset container len (+ diff (oref container len)))
                 (json-in-place--update-parent-offsets (oref container parent) diff)
-                (dolist (f modify-hooks) (funcall f))
+                (dolist (f (oref container container-change)) (funcall f 'add container entry))
+                (json-in-place--run-child-change-hooks (oref (oref container parent) parent))
                 entry))))))))
 
 (cl-defmethod json-in-place-append (value (container json-in-place-array))
@@ -429,30 +505,34 @@ Insert the VALUE at the end of the CONTAINER.
 The textual JSON representation is inserted in the buffer in the correct spot.
 VALUE must be serializable to JSON."
   (let* ((offset 1)
-         (modify-hooks (append (oref container change) ()))
          (begin (+ offset (oref container len) -1))
-         (buffer (let ((parent (oref container parent)))
-                   (while (not (json-in-place-root-p parent))
-                     (setq offset (+ offset (oref parent offset)))
-                     (setq modify-hooks (append (oref (oref parent parent) change) modify-hooks))
-                     (setq parent (oref (oref parent parent) parent)))
-                   (oref parent buffer))))
+         (root (let ((parent (oref container parent)))
+                 (while (not (json-in-place-root-p parent))
+                   (setq offset (+ offset (oref parent offset)))
+                   (setq parent (oref (oref parent parent) parent)))
+                 parent))
+         (buffer (oref root buffer)))
     (with-current-buffer buffer
       (save-excursion
         (atomic-change-group
           (goto-char begin)
           (unless (eq () (oref container value)) (insert ","))
           (let ((off (point)))
-            (json-insert value)
+            (json-in-place--json-insert value)
             (let ((diff (- (point) begin)))
               (goto-char off)
               (let ((entry (json-in-place-array-entry :parent container :index (cons () ()) :offset off :value ())))
                 (oset entry value (json-in-place--from-point entry))
                 (setcar (oref entry index) entry)
                 (oset container value (nconc (oref container value) (oref entry index)))
+                (let ((verify-result (json-in-place--verify root)))
+                  (when verify-result
+                    (oset container value (seq-take (oref container value) (- (seq-length (oref container value)) 1)))
+                    (error "Verification failed after appending value:\n%s" verify-result)))
                 (oset container len (+ diff (oref container len)))
                 (json-in-place--update-parent-offsets (oref container parent) diff)
-                (dolist (f modify-hooks) (funcall f))
+                (dolist (f (oref container container-change)) (funcall f 'add container entry))
+                (json-in-place--run-child-change-hooks (oref (oref container parent) parent))
                 entry))))))))
 
 (cl-defgeneric json-in-place-mark (arg) "Mark the text associated with ARG.")
