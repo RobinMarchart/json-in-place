@@ -130,7 +130,7 @@ Recursively update parents.")
       (let ((sibling (car index)))
         (oset sibling offset (+ difference (oref sibling offset))))
       (setq index (cdr index))))
-  (oset parent len (+ difference (oref parent len)))
+  (oset (oref parent parent) len (+ difference (oref (oref parent parent) len)))
   (json-in-place--update-parent-offsets (oref (oref parent parent) parent) difference))
 (cl-defmethod json-in-place--update-parent-offsets ((parent json-in-place-object-entry) (difference integer))
   "Move all entries after PARENT by DIFFERENCE. Object version."
@@ -139,7 +139,7 @@ Recursively update parents.")
       (let ((sibling (cdr (car index))))
         (oset sibling offset (+ difference (oref sibling offset)))
         (setq index (cdr index))))
-    (oset parent len (+ difference (oref parent len)))
+    (oset (oref parent parent) len (+ difference (oref (oref parent parent) len)))
     (json-in-place--update-parent-offsets (oref (oref parent parent) parent) difference)))
 
 (defun json-in-place--run-entry-remove-hooks (entry)
@@ -157,10 +157,11 @@ Recursively update parents.")
    (t (error "expected container entry, got: %s" entry))))
 
 (defun json-in-place--run-child-change-hooks (current)
-  "execute all child-change hooks of CURRENT and all parents recursively"
+  "execute all child-change hooks of CURRENT and all parents recursively
+CURRENT has to be ether root or an container entry"
   (unless (json-in-place-root-p current)
-    (unless (cl-typep current 'json-in-place-container) (error "Invalid value for current: %s" current))
-    (dolist (f (oref current child-change)) (funcall f current))
+    (unless (cl-typep current 'json-in-place-container-entry) (error "Invalid value for current: %s" current))
+    (dolist (f (oref (oref current parent) child-change)) (funcall f current))
     (json-in-place--run-child-change-hooks (oref (oref current parent) parent))))
 
 (defun json-in-place--run-change-delete-hooks (new old)
@@ -204,11 +205,11 @@ All hooks are appended to NEW from OLD if appropriate."
                 (when not-found
                   (setq new-i (cdr new-i)))))
             (dolist (entry (cdr new-l))
-              (dolist (f (oref old container-change)) (funcall f 'add new entry)))
+              (dolist (f (oref old container-change)) (funcall f 'add new (cdr entry))))
             (dolist (entry (cdr old-l))
-              (oset (oref entry value) active nil)
-              (dolist (f (oref old container-change)) (funcall f 'remove new entry))
-              (json-in-place--run-entry-remove-hooks entry))
+              (oset (oref (cdr entry) value) active nil)
+              (dolist (f (oref old container-change)) (funcall f 'remove new (cdr entry)))
+              (json-in-place--run-entry-remove-hooks (cdr entry)))
             (unless (or (cdr new-l) (cdr old-l))
               (dolist (f (oref old child-change)) (funcall f new)))))
          (t (error "Unknown container type: %s" (eieio-object-class new)))))
@@ -303,43 +304,45 @@ Parent is set to PARENT."
          (begin (point))
          (value (json-in-place--json-parse))
          (end (point))
-         (endb (point-max))
-         (object-length (- (if (equal end (- endb 1)) endb end) begin)))
+         (object-length (- end begin)))
     (pcase value
       ((pred stringp) (json-in-place-string :len object-length :parent parent :value value))
       ((pred numberp) (json-in-place-number :len object-length :parent parent :value value))
-      (':null (json-in-place-null :len object-length :parent parent))
-      (':false(json-in-place-bool :len object-length :parent parent :value nil))
-      ('t(json-in-place-bool :len object-length :parent parent :value t))
+      (:null (json-in-place-null :len object-length :parent parent))
+      (:false(json-in-place-bool :len object-length :parent parent :value nil))
+      ((guard (eq value t)) (json-in-place-bool :len object-length :parent parent :value t))
       ((pred arrayp)
-       (let* ( (value (append value nil)) (loop2 nil)
-               (res (json-in-place-array :len object-length :parent parent :value value)))
+       (let* ( (index (append value ())) (loop-start t)
+               (array (json-in-place-array :len object-length :parent parent :value index)))
          (goto-char begin)
          (search-forward "[" end)
-         (while value
-           (if loop2 (search-forward "," end) (setq loop2 t))
-           (let ((rec (json-in-place-array-entry :parent res :index value :offset (- (point) begin) :value nil)))
-             (oset rec value (json-in-place--from-point rec))
-             (setcar value rec))
-           (setq value (cdr value)))
+         (while index
+           ;; skip , after each entry
+           (if loop-start (setq loop-start nil) (search-forward "," end))
+           (let ((entry (json-in-place-array-entry
+                         :parent array :index index :offset (- (point) begin) :value nil)))
+             (oset entry value (json-in-place--from-point entry))
+             ;; set index
+             (setcar index entry))
+           ;; iterate through list
+           (setq index (cdr index)))
          (goto-char end)
-         res))
+         array))
       ((pred listp)
-       (let ((list-head value) (loop2 nil)
-             (res (json-in-place-object :len object-length :parent parent :value value)))
+       (let ((loop-start t)
+             (object (json-in-place-object :len object-length :parent parent :value value)))
          (goto-char  begin)
          (search-forward "{" end)
-         (while list-head
-           (if loop2 (search-forward "," end) (setq loop2 t))
+         (while value
+           (if loop-start (setq loop-start nil) (search-forward "," end))
            (json-parse-buffer)
            (search-forward ":" end)
-           (let ((rec (json-in-place-object-entry :parent res :index list-head :offset (- (point) begin) :value nil)))
-             (oset rec value (json-in-place--from-point rec))
-             (setcdr (car list-head) rec))
-           (setq list-head (cdr list-head)))
+           (let* ((entry (json-in-place-object-entry :parent object :index value :offset (- (point) begin) :value nil)))
+             (oset entry value (json-in-place--from-point entry))
+             (setcdr (car value) entry))
+           (setq value (cdr value)))
          (goto-char end)
-         res))
-
+         object))
       (_ (error "Unable to convert %s to json-in-place object" value)))))
 
 (defun json-in-place-from-buffer (buffer)
@@ -347,7 +350,11 @@ Parent is set to PARENT."
   (let ((root (json-in-place-root :buffer buffer :value nil)))
     (with-current-buffer buffer
       (save-excursion
-        (goto-char 0)
+        ;; ensure trailing newline
+        (unless (equal "\n" (buffer-substring (- (point-max) 1) (point-max)))
+          (goto-char (point-max))
+          (insert "\n"))
+        (goto-char (point-min))
         (oset root value (json-in-place--from-point root))
         (setq json-in-place-current-parsed root))
       root)))
@@ -355,20 +362,24 @@ Parent is set to PARENT."
 (defun json-in-place-reparse (&optional buffer-or-root print-status)
   "Re parse buffer and place the new value in root.
 BUFFER-OR-ROOT can be ether nil for the current buffer, the buffer containing
-the already parsed value or the root of the parsed value. If PRINT-STATUS is non
-nil, a message will be written on successful completion."
+the already parsed value, its name or the root of the parsed value. If
+PRINT-STATUS is non nil, a message will be written on successful completion."
   (interactive "bBuffer to parse\nd")
   (when (null buffer-or-root) (setq buffer-or-root (current-buffer)))
+  (when (stringp buffer-or-root) (setq buffer-or-root (get-buffer buffer-or-root)))
   (when (bufferp buffer-or-root) (setq buffer-or-root (buffer-local-value 'json-in-place-current-parsed buffer-or-root)))
   (unless (json-in-place-root-p buffer-or-root) (error "Expected root to be a root value, not %s" buffer-or-root))
   (with-current-buffer (oref buffer-or-root buffer)
     (save-excursion
-      (goto-char 0)
+      (unless (equal "\n" (buffer-substring (- (point-max) 1) (point-max)))
+        (goto-char (point-max))
+        (insert "\n"))
+      (goto-char (point-min))
       (let ((old (oref buffer-or-root value))
             (new (json-in-place--from-point buffer-or-root)))
         (json-in-place--move-hooks new old)
         (oset buffer-or-root value new)
-        (let ((verify-result (json-in-place--verify new)))
+        (let ((verify-result (json-in-place--verify buffer-or-root)))
           (when verify-result
             (oset buffer-or-root value old)
             (error "Verification of new buffer contents failed:\n%s" verify-result)))
@@ -407,7 +418,7 @@ keys of objects can only be replaced by strings."
                 (oset parent value old)
                 (error "Verification of replacement failed:\n%s" verify-result)))
             (json-in-place--update-parent-offsets parent difference)
-            (json-in-place--run-child-change-hooks (oref (oref old parent) parent))
+            (json-in-place--run-child-change-hooks (oref new parent))
             (json-in-place--run-change-delete-hooks new old)
             new))))))
 
@@ -425,16 +436,13 @@ keys of objects can only be replaced by strings."
         (setcdr prev (cdr index))))
     (let* ((offset 1)
            (root (let ((parent (oref (oref entry parent) parent)))
-                   (while (not (json-in-place-root-p entry))
+                   (while (not (json-in-place-root-p parent))
                      (setq offset (+ offset (oref parent offset)))
                      (setq parent (oref (oref parent parent) parent)))
                    parent))
            (buffer (oref root buffer))
-           (start (+ offset (oref entry offset)))
-           (end (if
-                    (cdr index)
-                    (+ offset (oref (car (cdr index)) offset))
-                  (+ offset (oref (oref entry parent) len) -1)))
+           (start (+ offset (oref (cdr (car prev)) offset) (oref (oref (cdr (car prev)) value) len)))
+           (end (+ offset (oref entry offset) (oref (oref entry value) len)))
            (difference (- start end)))
       (let ((verify-result (json-in-place--verify root)))
         (when verify-result
@@ -450,6 +458,7 @@ keys of objects can only be replaced by strings."
           (while index
             (aset (cdr (car index)) offset (+ difference (aref (cdr (car index)) offset)))
             (setq index (cdr index)))))
+      (oset (oref entry parent) len (+ difference (oref (oref entry parent) len)))
       (json-in-place--update-parent-offsets (oref (oref entry parent) parent) difference)
       (json-in-place--run-child-change-hooks (oref (oref entry parent) parent))
       (json-in-place--run-entry-remove-hooks entry)
@@ -464,13 +473,13 @@ position. CONTAINER object. OBJECT must be a json-in-place-object value."
   (unless (json-in-place-object-p container) (error "Invalid json-in-place-object: %s" container))
   (when (stringp key) (setq key (intern key)))
   (let* ((offset 1)
-         (begin (+ offset (oref container len) -1))
          (root (let ((parent (oref container parent)))
                  (while (not (json-in-place-root-p parent))
                    (setq offset (+ offset (oref parent offset)))
                    (setq parent (oref (oref parent parent) parent)))
                  parent))
-         (buffer (oref root buffer)))
+         (buffer (oref root buffer))
+         (begin (+ offset (oref container len) -1)))
     (with-current-buffer buffer
       (save-excursion
         (atomic-change-group
@@ -479,12 +488,12 @@ position. CONTAINER object. OBJECT must be a json-in-place-object value."
                  (print-escape-nonascii t)
                  (print-escape-newlines t))
             (when (oref container value) (insert ","))
-            (insert (prin1-to-string (symbol-name key)) " : "))
+            (insert "\n" (prin1-to-string (symbol-name key)) ": "))
           (let ((off (point)))
             (json-in-place--json-insert value)
             (let ((diff (- (point) begin)))
               (goto-char off)
-              (let ((entry (json-in-place-object-entry :parent container :index (cons () ()) :offset off :value ())))
+              (let ((entry (json-in-place-object-entry :parent container :index (cons () ()) :offset (- off offset) :value ())))
                 (oset entry value (json-in-place--from-point entry))
                 (setcar (oref entry index) (cons key entry))
                 (oset container value (nconc (oref container value) (oref entry index)))
@@ -496,32 +505,34 @@ position. CONTAINER object. OBJECT must be a json-in-place-object value."
                 (oset container len (+ diff (oref container len)))
                 (json-in-place--update-parent-offsets (oref container parent) diff)
                 (dolist (f (oref container container-change)) (funcall f 'add container entry))
-                (json-in-place--run-child-change-hooks (oref (oref container parent) parent))
+                (json-in-place--run-child-change-hooks (oref container parent))
                 entry))))))))
 
-(cl-defmethod json-in-place-append (value (container json-in-place-array))
+(defun json-in-place-append (value container)
   "Array Version.
 Insert the VALUE at the end of the CONTAINER.
 The textual JSON representation is inserted in the buffer in the correct spot.
 VALUE must be serializable to JSON."
+  (unless (json-in-place-array-p container) (error "Invalid json-in-place-array: %s" container))
   (let* ((offset 1)
-         (begin (+ offset (oref container len) -1))
          (root (let ((parent (oref container parent)))
                  (while (not (json-in-place-root-p parent))
                    (setq offset (+ offset (oref parent offset)))
                    (setq parent (oref (oref parent parent) parent)))
                  parent))
-         (buffer (oref root buffer)))
+         (buffer (oref root buffer))
+         (begin (+ offset (oref container len) -1)))
     (with-current-buffer buffer
       (save-excursion
         (atomic-change-group
           (goto-char begin)
           (unless (eq () (oref container value)) (insert ","))
+          (insert "\n")
           (let ((off (point)))
             (json-in-place--json-insert value)
             (let ((diff (- (point) begin)))
               (goto-char off)
-              (let ((entry (json-in-place-array-entry :parent container :index (cons () ()) :offset off :value ())))
+              (let ((entry (json-in-place-array-entry :parent container :index (cons () ()) :offset (- off offset) :value ())))
                 (oset entry value (json-in-place--from-point entry))
                 (setcar (oref entry index) entry)
                 (oset container value (nconc (oref container value) (oref entry index)))
@@ -532,37 +543,18 @@ VALUE must be serializable to JSON."
                 (oset container len (+ diff (oref container len)))
                 (json-in-place--update-parent-offsets (oref container parent) diff)
                 (dolist (f (oref container container-change)) (funcall f 'add container entry))
-                (json-in-place--run-child-change-hooks (oref (oref container parent) parent))
+                (json-in-place--run-child-change-hooks (oref container parent))
                 entry))))))))
 
-(cl-defgeneric json-in-place-mark (arg) "Mark the text associated with ARG.")
-
-(cl-defmethod json-in-place-mark ((value json-in-place-value))
-  "Mark the space occupied by the JSON VALUE."
-  (let* ((offset 1)
-         (buffer (let ((parent (oref value parent)))
-                   (while (not (json-in-place-root-p parent))
-                     (setq offset (+ offset (oref parent offset)))
-                     (setq parent (oref (oref parent parent) parent)))
-                   (oref parent buffer))))
-    (with-current-buffer buffer
-      (goto-char offset)
-      (push-mark (+ offset (oref value len)) t t))))
-
-(defun json-in-place-reformat (buffer) "Reformat json in BUFFER and reparse it"
+(defun json-in-place-reformat (&optional buffer) "Reformat json in BUFFER and reparse it"
        (interactive "bBuffer to parse")
+       (unless buffer (setq buffer (current-buffer)))
+       (when (stringp buffer) (setq buffer (get-buffer buffer)))
        (unless (bufferp buffer) (error "Invalid argument, expected buffer, got %s" buffer))
        (with-current-buffer buffer
          (save-excursion
            (json-pretty-print-buffer)
-           (goto-char 0)
-           (if json-in-place-current-parsed
-               (let ((original (oref json-in-place-current-parsed value)))
-                 (oset json-in-place-current-parsed value (json-in-place--from-point json-in-place-current-parsed))
-                 (iter-do (val (json-in-place-iter-values (oref entry value))) (dolist (f (oref val removal)) (funcall f))))
-             (let ((root (json-in-place-root :buffer buffer :value nil)))
-               (oset root value (json-in-place--from-point root))
-               (setq json-in-place-current-parsed root))))))
+           (json-in-place-reparse))))
 
 (provide 'json-in-place)
 ;;; json-in-place.el ends here
